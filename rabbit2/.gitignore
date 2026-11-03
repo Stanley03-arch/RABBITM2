@@ -1,0 +1,9 @@
+build/
+__pycache__/
+*.rbt2
+*.bin
+*.npz
+*.exe
+*.o
+tiny_olmoe/
+olmoe_hf/
