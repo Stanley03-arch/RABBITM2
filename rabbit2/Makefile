@@ -9,6 +9,9 @@ test: build/rabbit2
 	python3 tests/test_forward.py
 	python3 tests/test_convert.py
 	python3 tests/test_layout_big.py
+	python3 tests/test_expert_cache.py
+	python3 tests/test_engine_cache.py
+	python3 tests/test_avx2.py
 
 clean:
 	rm -rf build

@@ -27,6 +27,10 @@ def main():
     ap.add_argument("--ids", type=int, nargs="*", help="raw prompt token ids (instead of --prompt)")
     ap.add_argument("--n", type=int, default=30, help="max new tokens")
     ap.add_argument("--ctx", type=int, default=0, help="context cap (default: prompt + n)")
+    ap.add_argument("--expert-cache-mib", type=int, default=None,
+                    help="experimental local-file expert cache payload budget in MiB")
+    ap.add_argument("--kernel", choices=['scalar', 'auto', 'avx2'], default=None,
+                    help="experimental matvec kernel (default scalar)")
     ap.add_argument("--bin", default=None)
     args = ap.parse_args()
     if hasattr(sys.stdout, "reconfigure"):
@@ -50,6 +54,10 @@ def main():
 
     ctx = args.ctx or (len(ids) + args.n)
     cmd = [binary, args.model, "--gen", str(args.n), "--ctx", str(ctx)]
+    if args.expert_cache_mib is not None:
+        cmd += ["--expert-cache-mib", str(args.expert_cache_mib)]
+    if args.kernel is not None:
+        cmd += ["--kernel", args.kernel]
     if eos >= 0:
         cmd += ["--eos", str(eos)]
     cmd += [str(i) for i in ids]
