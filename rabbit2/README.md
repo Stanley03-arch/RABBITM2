@@ -5,8 +5,9 @@ bigger than RAM can run on an ordinary laptop by keeping the weights on disk.
 
 **Status: Milestone 2 built.** The engine can load a real MoE model (OLMoE-1B-7B) from a converted
 file and generate text. It is verified against its own NumPy reference. The final gate, matching the
-real Hugging Face implementation, still has to be run by you (see below). No quantization or explicit
-disk streaming yet; those are M3 and M4.
+real Hugging Face implementation, still has to be run by you (see below). An experimental local
+expert cache and opt-in AVX2 kernel are available, but quantization and remote/unbuffered streaming
+are not yet implemented.
 
 ## What is and isn't verified
 
@@ -42,8 +43,105 @@ Self-tests (no downloads; the tests also build the engine if it's missing):
 python tests/test_forward.py
 python tests/test_convert.py
 python tests/test_layout_big.py      # needs ~17 GB free temp space on Windows (sparse file on Linux)
+python tests/test_expert_cache.py    # cache + local HTTP + routing replay tests
+python tests/test_engine_cache.py    # local engine cache vs mmap inference
+python tests/test_avx2.py            # experimental CPU kernel vs scalar + NumPy
 ```
-Each should end with `ALL PASSED`. **First thing to do: run these on Windows and report any failure.**
+The first three should end with `ALL PASSED`; the unittest suites should end with `OK`.
+**First thing to do: run these on Windows and report any failure.**
+
+## Experimental local expert cache
+
+The C engine has an **optional local-file LRU expert cache**, disabled by default. Build the engine
+as above, then, for a model you already have locally, pass `--expert-cache-mib`:
+
+```
+python tools/run.py --model tiny.rbt2 --ids 1 2 3 --n 8 --expert-cache-mib 16
+```
+
+The budget must hold at least one whole expert; the engine reports hits, misses, evictions, bytes
+read, resident bytes and slot capacity on stderr. The cache uses synchronous file reads and is
+single-threaded. Its limit covers **only expert payload buffers**: metadata, non-expert weights,
+model mapping, OS page cache, Python, runtime state, KV cache and Windows use additional memory.
+The entire model still needs to be available as a local `.rbt2` file. The rest of the weights are
+memory-mapped as before; this is **not** a strict process or system RAM cap. Disk reads may also
+enter the OS page cache and duplicate memory. Close other applications and leave plenty of RAM free.
+The model file must not be modified while running.
+
+This is a correctness and measurement step, not a guaranteed speedup: compare with the default
+mmap path on the same prompt, model and cache state. It has been tested on Linux, not yet on Windows.
+It has no network streaming, quantization or prefetch, and does not enable fast 2T–3T inference.
+The default engine behavior remains unchanged when the flag is omitted.
+
+## Experimental CPU acceleration
+
+An opt-in AVX2 matvec kernel supports f32 and bf16 weights. It is compiled for x86 with GCC/Clang,
+including MinGW-w64 GCC, and selected at runtime only when the CPU and OS support AVX2. Other builds
+and CPUs fall back to scalar when `--kernel auto` is used. `--kernel avx2` instead fails explicitly
+if unavailable. The default remains the original scalar kernel. The i5-6300U supports AVX2, but the
+actual Windows build and speed on that laptop have not yet been verified.
+
+```
+python tools/run.py --model tiny.rbt2 --ids 1 2 3 --n 8 --kernel auto
+python tools/benchmark_kernel.py --synthetic
+```
+
+The synthetic benchmark creates a small temporary random model and compares repeated prompt/dump
+runs of scalar and auto kernels. It reports whole-process wall time (including startup and output),
+max logit difference and routing agreement. For an existing local model, use
+`python tools/benchmark_kernel.py --model tiny.rbt2`. These use warm OS caches and repeated token IDs;
+they do not measure cold-disk, remote access, or real chat generation. No speedup is guaranteed,
+especially when model reads rather than CPU math dominate. AVX2 changes floating-point accumulation
+order, so logits can differ slightly and near-tied router choices or generated tokens can differ.
+There is no fast-math or fused multiply-add in the AVX2 kernel. Compare outputs on your actual model
+before relying on it; the Hugging Face validation gates remain pending.
+
+## Experimental expert-cache replay benchmark (Windows and Linux)
+
+This is a **separate standalone prototype**, not an inference backend. It replays expert accesses through
+bounded in-process RAM and on-disk LRU caches. It does not generate text, quantize weights,
+prefetch, stream remote weights into the C engine, or establish that a trillion-parameter model can run.
+
+Quick demo, from the `rabbit2` directory (Python 3, no other packages required):
+
+```
+python tools/benchmark_cache.py demo
+```
+
+It starts a temporary local HTTP server, serves a small synthetic file, verifies each returned
+range, and deletes the fixture and cache on exit. It uses **loopback**, not the internet, and its
+speed is not a model or network benchmark. If Windows asks about network access, this server
+listens only on `127.0.0.1` and the demo does not require public network access.
+
+To replay **actual routing** from an existing local `.rbt2` model (requires NumPy and the C engine):
+
+```
+build\rabbit2.exe tiny.rbt2 --dump logits.bin routing.bin --ctx 32 1 2 3 4
+python tools/benchmark_cache.py replay --header tiny.rbt2 --routing routing.bin --source tiny.rbt2 --verify-file tiny.rbt2 --ram-mib 16 --disk-mib 128
+```
+
+On Linux/macOS use `build/rabbit2` instead. Token IDs must be valid for the model. The first
+command performs real local inference and creates a routing trace. The second measures only the
+expert reads in that trace; it **does not perform inference**. Its elapsed time includes reference
+verification when `--verify-file` is used, and is not tokens/second for generation. The default
+cache is temporary; `--cache-dir` opts into a persistent **dedicated** cache directory. RAM and
+disk defaults are 64 MiB and 256 MiB. `--max-range-mib` (32 by default) limits a single read.
+
+The source can instead be an HTTP(S) URL serving the **exact same immutable `.rbt2` file** with
+HTTP 206 byte-range support. Ordinary Hugging Face safetensors are *not* a `.rbt2` file and cannot
+be used directly here; a remote converted file must already exist. Use a URL pinned to an immutable
+revision, not a branch or expiring signed URL. Test the actual endpoint: redirects/storage backends
+may behave differently, require authentication, or reject range requests. The prototype has not
+been validated against Hugging Face's Xet backend and has no token-management interface. Replaying
+real traces also currently requires the corresponding model to have already been run locally.
+
+Disk and RAM limits count cached payloads only, not Python overhead, temporary fetch/verification
+buffers, the OS page cache, Windows, the model engine, context/KV cache, or unrelated files. Leave
+ample system RAM and disk space free. A single range is read into memory before caching. Cache
+entries are keyed by source and byte range, not verified by a content hash: use immutable sources,
+a trusted dedicated cache, and `--verify-file` where possible. This single-process prototype does
+not coordinate concurrent writers and should not share its cache directory with other processes.
+No remote 3T model or Windows runtime has been tested here.
 
 ## Gate A: tiny model through real Hugging Face code (about 5 minutes)
 
@@ -116,7 +214,8 @@ expert from disk later is a single aligned read. All offsets are computed by `la
 ## Design decisions worth keeping
 
 - **Reference first.** Every engine change must keep matching the NumPy model.
-- **One seam for experts.** All expert reads go through `get_expert()`. M4 replaces that one function.
+- **One seam for experts.** All expert reads go through `get_expert()`. The optional local cache uses
+  that seam; remote I/O and a strict total-memory budget remain future work.
 - **Memory-mapping is a stepping stone.** It lets a 14 GB model run in 8 GB RAM now, but the OS decides
   what stays cached. M4 replaces it with explicit I/O so RABBIT2 controls the cache and prefetching.
 - **No fast-math.** Keeps results reproducible while validating.
@@ -141,4 +240,4 @@ expert from disk later is a single aligned read. All offsets are computed by `la
 - A transposed *square* matrix (e.g. OLMoE's q_proj) can't be caught by shape checks; only the logit comparison can.
 - Needs a 64-bit build (a 32-bit process cannot map a multi-GB file).
 - Near-tied router scores can route differently between precisions. That is expected, not a bug.
-- Speed is not optimised yet. Single thread, scalar math.
+- Speed is not fully optimised. Single-threaded; experimental opt-in AVX2 matvec on supported builds.

@@ -11,6 +11,8 @@
  *   rabbit2 <model.rbt2> --info
  *       print the model config and byte layout (used by tests)
  *   --ctx N caps the context (KV cache) length; default min(max_seq, 512)
+ *   --expert-cache-mib N enables a bounded local expert-buffer cache (experimental)
+ *   --kernel scalar|auto|avx2 selects the experimental CPU matvec kernel
  *
  * What changed from M1:
  *   - weights may be float32 or bfloat16 (vectors/norms are always float32)
@@ -18,15 +20,26 @@
  *   - QK-norm and optional top-k renormalisation (OLMoE: qk_norm=1, norm_topk=0)
  *   - greedy generation, context cap, timing on stderr
  *
- * Design rule for later milestones: ALL expert weight access goes through get_expert().
- * Today it is a pointer into the mapped file. M4 replaces it with explicit streaming I/O.
+ * ALL expert weight access goes through get_expert(): mmap by default, or an optional
+ * bounded synchronous local-file cache. Remote streaming and strict total-RAM limits are future work.
  */
 #define _POSIX_C_SOURCE 200809L
+#define _FILE_OFFSET_BITS 64
+#include <errno.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* AVX2 is compiled only with GCC/Clang on x86 and selected at runtime.
+ * Other compilers/architectures retain the portable scalar implementation. */
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
+#define RBT_HAVE_AVX2_KERNEL 1
+#include <immintrin.h>
+#else
+#define RBT_HAVE_AVX2_KERNEL 0
+#endif
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -35,6 +48,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 #endif
@@ -67,11 +81,25 @@ typedef struct {
 } Mapped;
 
 typedef struct {
+    int layer, expert, valid;
+    uint64_t last_used;
+    unsigned char *data;
+} ExpertSlot;
+
+typedef struct {
+    FILE *file;
+    ExpertSlot *slots;
+    size_t capacity, resident;
+    uint64_t clock, hits, misses, evictions, bytes_read;
+} ExpertCache;
+
+typedef struct {
     Config c;
     size_t tok_emb, final_norm, lm_head, expert_stride;
     size_t esz; /* bytes per matrix element: 4 (f32) or 2 (bf16) */
     LayerOff *layers;
     Mapped map;
+    ExpertCache cache;
 } Model;
 
 typedef struct {
@@ -202,10 +230,73 @@ static int load_model(Model *m, const char *path) {
 static const float *VEC(const Model *m, size_t off) { return (const float *)(m->map.base + off); }
 static const void *MAT(const Model *m, size_t off) { return (const void *)(m->map.base + off); }
 
-/* The single seam through which every expert's weights are read.
- * Returns the start of w1[hidden,dim] | w3[hidden,dim] | w2[dim,hidden]. */
-static const unsigned char *get_expert(const Model *m, int layer, int e) {
-    return m->map.base + m->layers[layer].experts + (size_t)e * m->expert_stride;
+/* Optional explicit local-file expert cache. The rest of the model remains mmap'd.
+ * Budget covers expert payloads only, not metadata, stdio, mmap/page cache, KV or OS.
+ * The returned pointer is valid until the next get_expert() call. Single-threaded. */
+static int expert_cache_init(Model *m, const char *path, size_t budget) {
+    ExpertCache *c = &m->cache;
+    if (budget < m->expert_stride) {
+        fprintf(stderr, "expert cache budget too small: need at least %llu bytes for one expert\n",
+                (unsigned long long)m->expert_stride);
+        return 0;
+    }
+    size_t cap = budget / m->expert_stride;
+    size_t total_experts = (size_t)m->c.n_layers * (size_t)m->c.n_experts;
+    if (cap > total_experts) cap = total_experts;
+    if (cap > SIZE_MAX / sizeof(ExpertSlot)) { fprintf(stderr, "expert cache too large\n"); return 0; }
+    c->slots = (ExpertSlot *)calloc(cap, sizeof(ExpertSlot));
+    if (!c->slots) { fprintf(stderr, "cannot allocate expert cache metadata\n"); return 0; }
+    c->file = fopen(path, "rb");
+    if (!c->file) { fprintf(stderr, "cannot open model for expert reads\n"); free(c->slots); c->slots = NULL; return 0; }
+    c->capacity = cap;
+    return 1;
+}
+
+static void expert_cache_close(ExpertCache *c) {
+    if (c->file) fclose(c->file);
+    for (size_t i = 0; i < c->capacity; i++) free(c->slots[i].data);
+    free(c->slots);
+}
+
+static const unsigned char *get_expert(Model *m, int layer, int e) {
+    size_t offset = m->layers[layer].experts + (size_t)e * m->expert_stride;
+    ExpertCache *c = &m->cache;
+    if (!c->file) return m->map.base + offset;
+
+    ExpertSlot *victim = NULL;
+    for (size_t i = 0; i < c->capacity; i++) {
+        ExpertSlot *s = &c->slots[i];
+        if (s->valid && s->layer == layer && s->expert == e) {
+            s->last_used = ++c->clock;
+            c->hits++;
+            return s->data;
+        }
+        if (!victim || (!s->valid && victim->valid) ||
+            (s->valid == victim->valid && s->last_used < victim->last_used)) victim = s;
+    }
+    c->misses++;
+    if (!victim->data) {
+        victim->data = (unsigned char *)malloc(m->expert_stride);
+        if (!victim->data) { fprintf(stderr, "cannot allocate expert cache slot\n"); return NULL; }
+        c->resident++;
+    }
+    if (victim->valid) c->evictions++;
+    victim->valid = 0;
+    if (offset > INT64_MAX) { fprintf(stderr, "expert offset exceeds 64-bit file limit\n"); return NULL; }
+#ifdef _WIN32
+    if (_fseeki64(c->file, (__int64)offset, SEEK_SET) != 0) {
+#else
+    if (fseeko(c->file, (off_t)offset, SEEK_SET) != 0) {
+#endif
+        fprintf(stderr, "cannot seek to expert weights\n"); return NULL;
+    }
+    if (fread(victim->data, 1, m->expert_stride, c->file) != m->expert_stride) {
+        fprintf(stderr, "cannot read complete expert weights (layer %d expert %d)\n", layer, e);
+        return NULL;
+    }
+    c->bytes_read += m->expert_stride;
+    victim->layer = layer; victim->expert = e; victim->last_used = ++c->clock; victim->valid = 1;
+    return victim->data;
 }
 
 /* ------------------------------------------------------------------ math */
@@ -217,8 +308,56 @@ static inline float bf16f(uint16_t h) {
     return f;
 }
 
+/* Portable default; AVX2 is opt-in until real-model and Windows validation. */
+static int use_avx2 = 0;
+
+static int cpu_has_avx2(void) {
+#if RBT_HAVE_AVX2_KERNEL
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2") != 0;
+#else
+    return 0;
+#endif
+}
+
+#if RBT_HAVE_AVX2_KERNEL
+/* No FMA: preserve the no-fast-math policy. Accumulation order differs from scalar. */
+__attribute__((target("avx2,no-fma")))
+static void matvec_avx2(float *out, const void *W, int dtype, const float *x, int rows, int cols) {
+    for (int r = 0; r < rows; r++) {
+        const float *wf = dtype == DT_F32 ? (const float *)W + (size_t)r * cols : NULL;
+        const uint16_t *wb = dtype == DT_BF16 ? (const uint16_t *)W + (size_t)r * cols : NULL;
+        __m256 a = _mm256_setzero_ps(), b = _mm256_setzero_ps();
+        int i = 0;
+        for (; i + 15 < cols; i += 16) {
+            __m256 w0, w1;
+            if (wf) {
+                w0 = _mm256_loadu_ps(wf + i);
+                w1 = _mm256_loadu_ps(wf + i + 8);
+            } else {
+                __m128i x0 = _mm_loadu_si128((const __m128i *)(const void *)(wb + i));
+                __m128i x1 = _mm_loadu_si128((const __m128i *)(const void *)(wb + i + 8));
+                w0 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(x0), 16));
+                w1 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(x1), 16));
+            }
+            a = _mm256_add_ps(a, _mm256_mul_ps(w0, _mm256_loadu_ps(x + i)));
+            b = _mm256_add_ps(b, _mm256_mul_ps(w1, _mm256_loadu_ps(x + i + 8)));
+        }
+        float lanes[8];
+        _mm256_storeu_ps(lanes, _mm256_add_ps(a, b));
+        float sum = 0.0f;
+        for (int k = 0; k < 8; k++) sum += lanes[k];
+        for (; i < cols; i++) sum += (wf ? wf[i] : bf16f(wb[i])) * x[i];
+        out[r] = sum;
+    }
+}
+#endif
+
 /* out[r] = dot(W[r,:], x).  W is [rows, cols] row-major in the given dtype. */
 static void matvec(float *out, const void *W, int dtype, const float *x, int rows, int cols) {
+#if RBT_HAVE_AVX2_KERNEL
+    if (use_avx2) { matvec_avx2(out, W, dtype, x, rows, cols); return; }
+#endif
     if (dtype == DT_F32) {
         const float *w = (const float *)W;
         for (int r = 0; r < rows; r++, w += cols) {
@@ -313,7 +452,7 @@ static int state_ok(const State *s) {
 
 /* Processes one token at position pos; leaves logits in s->logits.
  * routing_out receives the chosen experts, [n_layers][top_k]. */
-static void forward(const Model *m, State *s, int token, int pos, int32_t *routing_out) {
+static int forward(Model *m, State *s, int token, int pos, int32_t *routing_out) {
     const Config *c = &m->c;
     const int hd = c->head_dim, q_dim = c->n_heads * hd, kv_dim = c->n_kv_heads * hd;
     const int group = c->n_heads / c->n_kv_heads;
@@ -391,6 +530,7 @@ static void forward(const Model *m, State *s, int token, int pos, int32_t *routi
         memset(s->moe, 0, (size_t)D * sizeof(float));
         for (int k = 0; k < c->top_k; k++) {
             const unsigned char *eb = get_expert(m, l, idx[k]); /* <-- the streaming seam */
+            if (!eb) return 0;
             const size_t mat_bytes = (size_t)H * D * m->esz;
             matvec(s->h1, eb, c->dtype, s->xb, H, D);                   /* w1 (gate) */
             matvec(s->h3, eb + mat_bytes, c->dtype, s->xb, H, D);       /* w3 (up)   */
@@ -404,6 +544,7 @@ static void forward(const Model *m, State *s, int token, int pos, int32_t *routi
 
     rmsnorm(s->xb, s->x, VEC(m, m->final_norm), D, c->rms_eps);
     matvec(s->logits, MAT(m, m->lm_head), c->dtype, s->xb, c->vocab, D);
+    return 1;
 }
 
 /* ------------------------------------------------------------------ main */
@@ -417,16 +558,17 @@ static int argmax(const float *v, int n) {
 static void usage(const char *p) {
     fprintf(stderr,
             "usage:\n"
-            "  %s <model.rbt2> --dump <logits.bin> <routing.bin> [--ctx N] <token> ...\n"
-            "  %s <model.rbt2> --gen <n> [--eos id] [--ctx N] <token> ...\n"
+            "  %s <model.rbt2> --dump <logits.bin> <routing.bin> [--ctx N] [--expert-cache-mib N] [--kernel auto|scalar|avx2] <token> ...\n"
+            "  %s <model.rbt2> --gen <n> [--eos id] [--ctx N] [--expert-cache-mib N] [--kernel auto|scalar|avx2] <token> ...\n"
             "  %s <model.rbt2> --info\n", p, p, p);
 }
 
 int main(int argc, char **argv) {
     if (argc < 3) { usage(argv[0]); return 2; }
 
-    const char *dump_l = NULL, *dump_r = NULL;
+    const char *dump_l = NULL, *dump_r = NULL, *kernel = NULL;
     int gen = 0, eos = -1, ctx = 0, nt = 0, info = 0;
+    size_t expert_cache_budget = 0;
     int *tokens = (int *)malloc(sizeof(int) * (size_t)argc);
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--dump") && i + 2 < argc) { dump_l = argv[++i]; dump_r = argv[++i]; }
@@ -434,10 +576,31 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) gen = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--eos") && i + 1 < argc) eos = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--kernel") && i + 1 < argc) kernel = argv[++i];
+        else if (!strcmp(argv[i], "--expert-cache-mib") && i + 1 < argc) {
+            const char *arg = argv[++i];
+            char *end = NULL;
+            errno = 0;
+            unsigned long long mib = strtoull(arg, &end, 10);
+            if (arg[0] < '0' || arg[0] > '9' || *end || errno || !mib || mib > SIZE_MAX / (1024u * 1024u)) {
+                fprintf(stderr, "--expert-cache-mib must be a positive integer that fits in memory\n"); return 2;
+            }
+            expert_cache_budget = (size_t)mib * (1024u * 1024u);
+        }
         else if (argv[i][0] == '-' && argv[i][1] == '-') { fprintf(stderr, "bad option %s\n", argv[i]); usage(argv[0]); return 2; }
         else tokens[nt++] = atoi(argv[i]);
     }
     if (!info && (nt < 1 || (!dump_l && gen <= 0))) { usage(argv[0]); return 2; }
+    if (kernel) {
+        if (strcmp(kernel, "scalar") && strcmp(kernel, "auto") && strcmp(kernel, "avx2")) {
+            fprintf(stderr, "--kernel must be scalar, auto or avx2\n"); return 2;
+        }
+        if (!strcmp(kernel, "avx2") && !cpu_has_avx2()) {
+            fprintf(stderr, "AVX2 kernel unavailable on this CPU or build\n"); return 1;
+        }
+        use_avx2 = strcmp(kernel, "scalar") != 0 && cpu_has_avx2();
+        fprintf(stderr, "matvec kernel: %s\n", use_avx2 ? "avx2" : "scalar");
+    }
 
     Model m;
     memset(&m, 0, sizeof(m));
@@ -457,6 +620,8 @@ int main(int argc, char **argv) {
                (unsigned long long)m.map.size);
         return 0;
     }
+
+    if (expert_cache_budget && !expert_cache_init(&m, argv[1], expert_cache_budget)) return 1;
 
     if (ctx <= 0) ctx = c->max_seq < 512 ? c->max_seq : 512;
     if (ctx > c->max_seq) ctx = c->max_seq;
@@ -479,7 +644,11 @@ int main(int argc, char **argv) {
 
     double t0 = now_sec();
     for (int i = 0; i < nt; i++) {
-        forward(&m, &s, tokens[i], i, routing);
+        if (!forward(&m, &s, tokens[i], i, routing)) {
+            if (fl) { fclose(fl); fclose(fr); }
+            expert_cache_close(&m.cache);
+            return 1;
+        }
         if (fl) {
             fwrite(s.logits, sizeof(float), (size_t)c->vocab, fl);
             fwrite(routing, sizeof(int32_t), (size_t)c->n_layers * c->top_k, fr);
@@ -499,12 +668,24 @@ int main(int argc, char **argv) {
             produced++;
             if (next == eos) break;
             if (g + 1 == gen) break;
-            forward(&m, &s, next, pos++, routing);
+            if (!forward(&m, &s, next, pos++, routing)) {
+                expert_cache_close(&m.cache);
+                return 1;
+            }
         }
     }
     double t2 = now_sec();
     fprintf(stderr, "prompt: %d tokens in %.2fs (%.2f tok/s)", nt, t1 - t0, nt / (t1 - t0 + 1e-9));
     if (gen > 0) fprintf(stderr, " | generated %d in %.2fs (%.2f tok/s)", produced, t2 - t1, produced / (t2 - t1 + 1e-9));
     fprintf(stderr, "\n");
+    if (m.cache.file) {
+        fprintf(stderr, "expert cache: hits=%llu misses=%llu evictions=%llu bytes_read=%llu "
+                "resident_bytes=%llu capacity_bytes=%llu\n",
+                (unsigned long long)m.cache.hits, (unsigned long long)m.cache.misses,
+                (unsigned long long)m.cache.evictions, (unsigned long long)m.cache.bytes_read,
+                (unsigned long long)(m.cache.resident * m.expert_stride),
+                (unsigned long long)(m.cache.capacity * m.expert_stride));
+        expert_cache_close(&m.cache);
+    }
     return 0;
 }
