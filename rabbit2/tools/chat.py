@@ -32,6 +32,10 @@ def main():
     ap.add_argument("--system", default="", help="optional text prepended before each user turn")
     ap.add_argument("--expert-cache-mib", type=int, default=None)
     ap.add_argument("--kernel", choices=["scalar", "auto", "avx2"], default=None)
+    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--top-k", type=int, default=0, dest="top_k")
+    ap.add_argument("--top-p", type=float, default=1.0, dest="top_p")
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--bin", default=None)
     ap.add_argument("--max-history-tokens", type=int, default=2048, help="trim oldest history when prompt exceeds this")
     args = ap.parse_args()
@@ -49,6 +53,14 @@ def main():
         extra += ["--expert-cache-mib", str(args.expert_cache_mib)]
     if args.kernel is not None:
         extra += ["--kernel", args.kernel]
+    if args.temperature and args.temperature > 0:
+        extra += ["--temperature", str(args.temperature)]
+    if args.top_k:
+        extra += ["--top-k", str(args.top_k)]
+    if args.top_p < 1.0:
+        extra += ["--top-p", str(args.top_p)]
+    if args.seed:
+        extra += ["--seed", str(args.seed)]
 
     history_ids = []
     print("Rabbit2 chat (greedy, stateless per turn via engine; history kept in Python). Ctrl+C to exit.")

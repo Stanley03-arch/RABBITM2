@@ -147,15 +147,56 @@ def forward(cfg, w, tokens):
     return x @ f64(w["lm_head"]).T, routing
 
 
-def greedy(cfg, w, prompt, n_new, eos=-1):
-    """Greedy continuation by re-running the full sequence each step (slow, obviously correct)."""
+def sample_next(logits, temperature=1.0, top_k=0, top_p=1.0, rng=None):
+    """Sample one token id from logits (float array). temperature<=0 => argmax."""
+    logits = np.asarray(logits, dtype=np.float64)
+    if temperature <= 0:
+        return int(np.argmax(logits))
+    if rng is None:
+        rng = np.random.default_rng()
+    x = logits / float(temperature)
+    vocab = x.shape[0]
+    keep = np.ones(vocab, dtype=bool)
+    if top_k and top_k > 0 and top_k < vocab:
+        idx = np.argpartition(-x, top_k - 1)[:top_k]
+        mask = np.zeros(vocab, dtype=bool)
+        mask[idx] = True
+        keep &= mask
+    probs = softmax(x)
+    probs = np.where(keep, probs, 0.0)
+    if 0 < top_p < 1.0:
+        order = np.argsort(-probs, kind="stable")
+        sorted_p = probs[order]
+        cum = np.cumsum(sorted_p)
+        cutoff = np.searchsorted(cum, top_p, side="left") + 1
+        nucleus = np.zeros(vocab, dtype=bool)
+        nucleus[order[:cutoff]] = True
+        probs = np.where(nucleus, probs, 0.0)
+    s = probs.sum()
+    if not np.isfinite(s) or s <= 0:
+        probs = np.where(keep, 1.0, 0.0)
+        s = probs.sum()
+        if s <= 0:
+            return int(np.argmax(logits))
+    probs /= s
+    return int(rng.choice(vocab, p=probs))
+
+
+def generate(cfg, w, prompt, n_new, eos=-1, temperature=0.0, top_k=0, top_p=1.0, seed=None):
+    """Continuation by re-running the full sequence each step (slow, obviously correct)."""
     toks = list(prompt)
+    rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
     for _ in range(n_new):
         if len(toks) >= cfg.max_seq:
             break
         logits, _ = forward(cfg, w, toks)
-        nxt = int(np.argmax(logits[-1]))
+        nxt = sample_next(logits[-1], temperature=temperature, top_k=top_k, top_p=top_p, rng=rng)
         toks.append(nxt)
         if nxt == eos:
             break
     return toks[len(prompt):]
+
+
+def greedy(cfg, w, prompt, n_new, eos=-1):
+    """Greedy continuation by re-running the full sequence each step (slow, obviously correct)."""
+    return generate(cfg, w, prompt, n_new, eos=eos, temperature=0.0)

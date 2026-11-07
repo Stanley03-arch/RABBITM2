@@ -159,6 +159,10 @@ def main():
     ap.add_argument("--model-id", default="rabbit2-local")
     ap.add_argument("--expert-cache-mib", type=int, default=None)
     ap.add_argument("--kernel", choices=["scalar", "auto", "avx2"], default=None)
+    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--top-k", type=int, default=0, dest="top_k")
+    ap.add_argument("--top-p", type=float, default=1.0, dest="top_p")
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--bin", default=None)
     args = ap.parse_args()
 
@@ -175,6 +179,14 @@ def main():
         extra += ["--expert-cache-mib", str(args.expert_cache_mib)]
     if args.kernel is not None:
         extra += ["--kernel", args.kernel]
+    if args.temperature and args.temperature > 0:
+        extra += ["--temperature", str(args.temperature)]
+    if args.top_k:
+        extra += ["--top-k", str(args.top_k)]
+    if args.top_p < 1.0:
+        extra += ["--top-p", str(args.top_p)]
+    if args.seed:
+        extra += ["--seed", str(args.seed)]
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.cfg = {

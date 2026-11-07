@@ -555,11 +555,63 @@ static int argmax(const float *v, int n) {
     return best;
 }
 
+static uint64_t rng_next(uint64_t *s) {
+    uint64_t x = *s ? *s : 0x9e3779b97f4a7c15ULL;
+    x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+    *s = x;
+    return x * 2685821657736338717ULL;
+}
+
+static double rng_uniform(uint64_t *s) {
+    return (rng_next(s) >> 11) * (1.0 / 9007199254740992.0);
+}
+
+static int sample_logits(const float *logits, int n, float temperature, int top_k, float top_p,
+                         uint64_t *rng, int *idx, float *prob) {
+    if (temperature <= 0.0f) return argmax(logits, n);
+    for (int i = 0; i < n; i++) { idx[i] = i; prob[i] = logits[i] / temperature; }
+    if (top_k > 0 && top_k < n) {
+        for (int i = 0; i < top_k; i++) {
+            int best = i;
+            for (int j = i + 1; j < n; j++) if (prob[j] > prob[best]) best = j;
+            float tp = prob[i]; prob[i] = prob[best]; prob[best] = tp;
+            int ti = idx[i]; idx[i] = idx[best]; idx[best] = ti;
+        }
+        for (int i = top_k; i < n; i++) prob[i] = -INFINITY;
+        for (int i = 0; i < n; i++) logits = logits; /* keep logits pointer used */
+    }
+    float mx = -INFINITY;
+    for (int i = 0; i < n; i++) if (prob[i] > mx) mx = prob[i];
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        if (isfinite(prob[i])) { prob[i] = expf(prob[i] - mx); sum += prob[i]; }
+        else prob[i] = 0.0f;
+    }
+    if (!(sum > 0.0f)) return argmax(logits, n);
+    for (int i = 0; i < n; i++) prob[i] /= sum;
+    if (top_p > 0.0f && top_p < 1.0f) {
+        int m = n;
+        if (top_k > 0 && top_k < n) m = top_k;
+        float cum = 0.0f;
+        int keep = m;
+        for (int i = 0; i < m; i++) { cum += prob[i]; if (cum >= top_p) { keep = i + 1; break; } }
+        for (int i = keep; i < n; i++) prob[i] = 0.0f;
+        sum = 0.0f;
+        for (int i = 0; i < n; i++) sum += prob[i];
+        if (!(sum > 0.0f)) return idx[0];
+        for (int i = 0; i < n; i++) prob[i] /= sum;
+    }
+    double r = rng_uniform(rng), cum = 0.0;
+    for (int i = 0; i < n; i++) { cum += prob[i]; if (r < cum) return idx[i]; }
+    for (int i = n - 1; i >= 0; i--) if (prob[i] > 0.0f) return idx[i];
+    return argmax(logits, n);
+}
+
 static void usage(const char *p) {
     fprintf(stderr,
             "usage:\n"
             "  %s <model.rbt2> --dump <logits.bin> <routing.bin> [--ctx N] [--expert-cache-mib N] [--kernel auto|scalar|avx2] <token> ...\n"
-            "  %s <model.rbt2> --gen <n> [--eos id] [--ctx N] [--expert-cache-mib N] [--kernel auto|scalar|avx2] <token> ...\n"
+            "  %s <model.rbt2> --gen <n> [--eos id] [--ctx N] [--temperature T] [--top-k K] [--top-p P] [--seed S] [--expert-cache-mib N] [--kernel auto|scalar|avx2] <token> ...\n"
             "  %s <model.rbt2> --info\n", p, p, p);
 }
 
@@ -567,7 +619,9 @@ int main(int argc, char **argv) {
     if (argc < 3) { usage(argv[0]); return 2; }
 
     const char *dump_l = NULL, *dump_r = NULL, *kernel = NULL;
-    int gen = 0, eos = -1, ctx = 0, nt = 0, info = 0;
+    int gen = 0, eos = -1, ctx = 0, nt = 0, info = 0, top_k_sample = 0;
+    float temperature = 0.0f, top_p = 1.0f;
+    unsigned long long seed = 0;
     size_t expert_cache_budget = 0;
     int *tokens = (int *)malloc(sizeof(int) * (size_t)argc);
     for (int i = 2; i < argc; i++) {
@@ -577,6 +631,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--eos") && i + 1 < argc) eos = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--kernel") && i + 1 < argc) kernel = argv[++i];
+        else if (!strcmp(argv[i], "--temperature") && i + 1 < argc) temperature = (float)strtod(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--top-k") && i + 1 < argc) top_k_sample = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--top-p") && i + 1 < argc) top_p = (float)strtod(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--expert-cache-mib") && i + 1 < argc) {
             const char *arg = argv[++i];
             char *end = NULL;
@@ -660,19 +718,25 @@ int main(int argc, char **argv) {
     int produced = 0;
     if (gen > 0) {
         if (gen > ctx - nt) gen = ctx - nt;
+        int *sample_idx = (int *)malloc(sizeof(int) * (size_t)c->vocab);
+        float *sample_prob = (float *)malloc(sizeof(float) * (size_t)c->vocab);
+        uint64_t rng = seed ? seed : 0x9e3779b97f4a7c15ULL;
+        if (!sample_idx || !sample_prob) { fprintf(stderr, "out of memory for sampling buffers\n"); return 1; }
         int pos = nt;
         for (int g = 0; g < gen; g++) {
-            int next = argmax(s.logits, c->vocab);
+            int next = sample_logits(s.logits, c->vocab, temperature, top_k_sample, top_p, &rng, sample_idx, sample_prob);
             printf("%d\n", next);
             fflush(stdout);
             produced++;
             if (next == eos) break;
             if (g + 1 == gen) break;
             if (!forward(&m, &s, next, pos++, routing)) {
+                free(sample_idx); free(sample_prob);
                 expert_cache_close(&m.cache);
                 return 1;
             }
         }
+        free(sample_idx); free(sample_prob);
     }
     double t2 = now_sec();
     fprintf(stderr, "prompt: %d tokens in %.2fs (%.2f tok/s)", nt, t1 - t0, nt / (t1 - t0 + 1e-9));

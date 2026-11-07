@@ -31,6 +31,10 @@ def main():
                     help="experimental local-file expert cache payload budget in MiB")
     ap.add_argument("--kernel", choices=['scalar', 'auto', 'avx2'], default=None,
                     help="experimental matvec kernel (default scalar)")
+    ap.add_argument("--temperature", type=float, default=0.0, help="sampling temperature (0=greedy)")
+    ap.add_argument("--top-k", type=int, default=0, dest="top_k", help="sample from top-k tokens (0=disabled)")
+    ap.add_argument("--top-p", type=float, default=1.0, dest="top_p", help="nucleus sampling threshold")
+    ap.add_argument("--seed", type=int, default=0, help="sampling RNG seed (0=default)")
     ap.add_argument("--bin", default=None)
     ap.add_argument("--info", action="store_true", help="print engine model info and exit")
     args = ap.parse_args()
@@ -63,6 +67,14 @@ def main():
         cmd += ["--expert-cache-mib", str(args.expert_cache_mib)]
     if args.kernel is not None:
         cmd += ["--kernel", args.kernel]
+    if args.temperature and args.temperature > 0:
+        cmd += ["--temperature", str(args.temperature)]
+    if args.top_k:
+        cmd += ["--top-k", str(args.top_k)]
+    if args.top_p < 1.0:
+        cmd += ["--top-p", str(args.top_p)]
+    if args.seed:
+        cmd += ["--seed", str(args.seed)]
     if eos >= 0:
         cmd += ["--eos", str(eos)]
     cmd += [str(i) for i in ids]
