@@ -1,0 +1,2 @@
+﻿# requirements (core runtime for tools/tests that need NumPy)
+numpy>=1.24

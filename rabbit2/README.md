@@ -210,8 +210,8 @@ The prompt phase is slower per token on the first run (cold cache).
 | `tools/plan.py` | Read-only capacity/memory plan from a `.rbt2` header (Colibri-inspired guidance) |
 | `tools/doctor.py` | Check local setup (Python deps, compiler, engine, optional model parse) |
 | `tools/chat.py` | Simple greedy chat loop (keeps history in Python; engine runs per turn) |
-| `tools/serve.py` | Minimal local OpenAI-compatible HTTP server (greedy, non-streaming) |
-| `tests/` | Self-tests, including `test_plan.py` and `test_serve.py` (no engine) |
+| `tools/serve.py` | Minimal local OpenAI-compatible HTTP server (SSE `stream=true` supported) |
+| `tests/` | Self-tests, including `test_plan.py`, `test_serve.py`, `test_sampling_ref.py` (no engine) |
 | `build.bat` | Windows build helper (MinGW-w64 gcc) |
 
 ## File format v2 (.rbt2)

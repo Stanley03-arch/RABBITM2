@@ -1,0 +1,4 @@
+﻿# Optional extras
+transformers>=4.40  # tokenizer, HF conversion/validation
+torch              # HF validation / dump_hf_logits
+huggingface_hub    # model downloads
