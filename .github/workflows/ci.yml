@@ -1,0 +1,42 @@
+﻿name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install --upgrade pip numpy
+      - name: Build (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p build
+          gcc -O2 -std=c99 -Wall -Wextra -o build/rabbit2 src/rabbit2.c -lm
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p build
+          gcc -O2 -std=c99 -Wall -Wextra -o build/rabbit2.exe src/rabbit2.c
+      - name: Python-only tests
+        run: |
+          python -m unittest rabbit2/tests/test_plan.py rabbit2/tests/test_serve.py -v
+          python -m unittest rabbit2.tests.test_expert_cache -v
+        working-directory: .
+      - name: Engine tests
+        run: |
+          python rabbit2/tests/test_forward.py
+          python rabbit2/tests/test_convert.py
+          python rabbit2/tests/test_layout_big.py
+          python -m unittest rabbit2.tests.test_engine_cache rabbit2.tests.test_avx2 -v
+        working-directory: .
+        env:
+          RABBIT2_SPARSE_OK: '1'

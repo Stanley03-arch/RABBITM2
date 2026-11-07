@@ -42,6 +42,7 @@ mkdir build
 gcc -O2 -std=c99 -o build/rabbit2 src/rabbit2.c -lm        # Linux/macOS
 gcc -O2 -std=c99 -o build\rabbit2.exe src\rabbit2.c         # Windows
 ```
+Or on Windows: `build.bat`
 Plan a model (no engine required): `python tools/plan.py model.rbt2 --ram-gib 8`
 Self-tests (no downloads; tests that need the engine also build it if missing):
 ```
@@ -209,7 +210,9 @@ The prompt phase is slower per token on the first run (cold cache).
 | `tools/plan.py` | Read-only capacity/memory plan from a `.rbt2` header (Colibri-inspired guidance) |
 | `tools/doctor.py` | Check local setup (Python deps, compiler, engine, optional model parse) |
 | `tools/chat.py` | Simple greedy chat loop (keeps history in Python; engine runs per turn) |
-| `tests/` | Self-tests, including `test_plan.py` (no engine) |
+| `tools/serve.py` | Minimal local OpenAI-compatible HTTP server (greedy, non-streaming) |
+| `tests/` | Self-tests, including `test_plan.py` and `test_serve.py` (no engine) |
+| `build.bat` | Windows build helper (MinGW-w64 gcc) |
 
 ## File format v2 (.rbt2)
 
