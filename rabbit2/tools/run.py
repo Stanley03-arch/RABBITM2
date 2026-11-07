@@ -32,6 +32,7 @@ def main():
     ap.add_argument("--kernel", choices=['scalar', 'auto', 'avx2'], default=None,
                     help="experimental matvec kernel (default scalar)")
     ap.add_argument("--bin", default=None)
+    ap.add_argument("--info", action="store_true", help="print engine model info and exit")
     args = ap.parse_args()
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -40,6 +41,10 @@ def main():
     binary = args.bin or os.path.join(ROOT, "build", exe)
     if not os.path.exists(binary):
         sys.exit(f"engine not built: {binary}")
+
+    if args.info:
+        res = subprocess.run([binary, args.model, "--info"])
+        sys.exit(res.returncode)
 
     tok, eos = None, -1
     if args.ids:

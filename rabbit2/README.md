@@ -32,13 +32,18 @@ files and vLLM's implementation, but only a comparison with Hugging Face's own c
 ```
 pip install numpy            # needed for tests and the converter
 ```
+Check your environment:
+```
+python tools/doctor.py
+```
 Build (any C99 compiler; on Windows install MSYS2 + MinGW-w64 gcc, 64-bit):
 ```
 mkdir build
 gcc -O2 -std=c99 -o build/rabbit2 src/rabbit2.c -lm        # Linux/macOS
 gcc -O2 -std=c99 -o build\rabbit2.exe src\rabbit2.c         # Windows
 ```
-Self-tests (no downloads; the tests also build the engine if it's missing):
+Plan a model (no engine required): `python tools/plan.py model.rbt2 --ram-gib 8`
+Self-tests (no downloads; tests that need the engine also build it if missing):
 ```
 python tests/test_forward.py
 python tests/test_convert.py
@@ -46,6 +51,7 @@ python tests/test_layout_big.py      # needs ~17 GB free temp space on Windows (
 python tests/test_expert_cache.py    # cache + local HTTP + routing replay tests
 python tests/test_engine_cache.py    # local engine cache vs mmap inference
 python tests/test_avx2.py            # experimental CPU kernel vs scalar + NumPy
+python tests/test_plan.py            # capacity planner (no engine)
 ```
 The first three should end with `ALL PASSED`; the unittest suites should end with `OK`.
 **First thing to do: run these on Windows and report any failure.**
@@ -199,8 +205,11 @@ The prompt phase is slower per token on the first run (cold cache).
 | `tools/make_tiny_hf.py` | Tiny random OLMoE built with the real HF code (Gate A) |
 | `tools/check_vs_hf.py` | Compare engine to HF live (`--hf`) or to a saved reference (`--ref`) |
 | `tools/dump_hf_logits.py` | Save HF reference logits and routing on a bigger machine |
-| `tools/run.py` | Tokenise, generate, decode |
-| `tests/` | The self-tests listed above |
+| `tools/run.py` | Tokenise, generate, decode; supports `--info` for engine model info |
+| `tools/plan.py` | Read-only capacity/memory plan from a `.rbt2` header (Colibri-inspired guidance) |
+| `tools/doctor.py` | Check local setup (Python deps, compiler, engine, optional model parse) |
+| `tools/chat.py` | Simple greedy chat loop (keeps history in Python; engine runs per turn) |
+| `tests/` | Self-tests, including `test_plan.py` (no engine) |
 
 ## File format v2 (.rbt2)
 
