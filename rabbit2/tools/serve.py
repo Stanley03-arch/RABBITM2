@@ -108,6 +108,49 @@ def iter_completion_chunks(model_id, tokenizer, token_iter):
            "choices": [{"index": 0, "text": "", "finish_reason": "stop"}]}
 
 
+
+
+def parse_generation_params(payload, default_n, default_extra):
+    n = payload.get('max_tokens')
+    if n is None:
+        n = payload.get('max_completion_tokens')
+    if n is None:
+        n = default_n
+    try:
+        n = int(n)
+    except Exception:
+        raise ValueError('max_tokens must be an integer')
+    if n < 0 or n > 1_000_000:
+        raise ValueError('max_tokens out of range')
+    extra = list(default_extra)
+    def drop(flag):
+        nonlocal extra
+        out=[]; i=0
+        while i<len(extra):
+            if extra[i]==flag and i+1<len(extra): i+=2; continue
+            out.append(extra[i]); i+=1
+        extra=out
+    if 'temperature' in payload:
+        t=float(payload['temperature'])
+        if t < 0: raise ValueError('temperature must be >= 0')
+        drop('--temperature')
+        if t>0: extra+=['--temperature', str(t)]
+    if 'top_p' in payload:
+        v=float(payload['top_p'])
+        if not (0 < v <= 1): raise ValueError('top_p must be in (0, 1]')
+        drop('--top-p')
+        if v<1: extra+=['--top-p', str(v)]
+    if 'top_k' in payload:
+        k=int(payload['top_k'])
+        if k < 0: raise ValueError('top_k must be >= 0')
+        drop('--top-k')
+        if k>0: extra+=['--top-k', str(k)]
+    if 'seed' in payload and payload['seed'] is not None:
+        s=int(payload['seed'])
+        drop('--seed')
+        if s!=0: extra+=['--seed', str(s)]
+    return n, extra
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "Rabbit2Serve/0.2"
 
@@ -173,10 +216,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._completion(payload)
         return self._json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
 
-    def _generate(self, prompt, max_tokens):
+    def _generate(self, prompt, max_tokens, extra=None):
         cfg = self.server.cfg
         ids, ctx, ptok = self._prepare(prompt, max_tokens)
-        new_ids, timing = run_engine(cfg["binary"], cfg["model"], ids, max_tokens, ctx, cfg["eos"], cfg["extra"])
+        new_ids, timing = run_engine(cfg["binary"], cfg["model"], ids, max_tokens, ctx, cfg["eos"], extra if extra is not None else cfg["extra"])
         text = cfg["tokenizer"].decode(new_ids, skip_special_tokens=True)
         return text, ptok, len(new_ids), timing
 
@@ -184,7 +227,10 @@ class Handler(BaseHTTPRequestHandler):
         messages = payload.get("messages")
         if not isinstance(messages, list) or not messages:
             return self._json(400, {"error": {"message": "messages must be a non-empty list", "type": "invalid_request_error"}})
-        max_tokens = int(payload.get("max_tokens") or payload.get("max_completion_tokens") or self.server.cfg["n"])
+        try:
+            max_tokens, extra = parse_generation_params(payload, self.server.cfg["n"], self.server.cfg["extra"])
+        except Exception as e:
+            return self._json(400, {"error": {"message": str(e), "type": "invalid_request_error"}})
         prompt = messages_to_prompt(messages)
         if payload.get("stream"):
             try:
@@ -192,10 +238,10 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._json(400, {"error": {"message": str(e), "type": "invalid_request_error"}})
             cfg = self.server.cfg
-            tokens = stream_engine(cfg["binary"], cfg["model"], ids, max_tokens, ctx, cfg["eos"], cfg["extra"])
+            tokens = stream_engine(cfg["binary"], cfg["model"], ids, max_tokens, ctx, cfg["eos"], extra)
             return self._sse(iter_chat_chunks(cfg["model_id"], cfg["tokenizer"], tokens))
         try:
-            text, ptok, ctok, timing = self._generate(prompt, max_tokens)
+            text, ptok, ctok, timing = self._generate(prompt, max_tokens, extra)
         except EngineError as e:
             return self._json(500, {"error": {"message": str(e), "type": "server_error"}})
         now = int(time.time())
@@ -211,17 +257,20 @@ class Handler(BaseHTTPRequestHandler):
         prompt = payload.get("prompt")
         if not isinstance(prompt, str):
             return self._json(400, {"error": {"message": "prompt must be a string", "type": "invalid_request_error"}})
-        max_tokens = int(payload.get("max_tokens") or self.server.cfg["n"])
+        try:
+            max_tokens, extra = parse_generation_params(payload, self.server.cfg["n"], self.server.cfg["extra"])
+        except Exception as e:
+            return self._json(400, {"error": {"message": str(e), "type": "invalid_request_error"}})
         if payload.get("stream"):
             try:
                 ids, ctx, _ = self._prepare(prompt, max_tokens)
             except Exception as e:
                 return self._json(400, {"error": {"message": str(e), "type": "invalid_request_error"}})
             cfg = self.server.cfg
-            tokens = stream_engine(cfg["binary"], cfg["model"], ids, max_tokens, ctx, cfg["eos"], cfg["extra"])
+            tokens = stream_engine(cfg["binary"], cfg["model"], ids, max_tokens, ctx, cfg["eos"], extra)
             return self._sse(iter_completion_chunks(cfg["model_id"], cfg["tokenizer"], tokens))
         try:
-            text, ptok, ctok, timing = self._generate(prompt, max_tokens)
+            text, ptok, ctok, timing = self._generate(prompt, max_tokens, extra)
         except EngineError as e:
             return self._json(500, {"error": {"message": str(e), "type": "server_error"}})
         now = int(time.time())
@@ -293,3 +342,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

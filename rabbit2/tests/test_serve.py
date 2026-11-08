@@ -63,6 +63,30 @@ class ServeTests(unittest.TestCase):
         self.assertNotIn('--eos', cmd)
         self.assertIn('--temperature', cmd)
 
+    def test_parse_generation_params_defaults(self):
+        n, extra = serve.parse_generation_params({}, 64, ['--kernel', 'auto'])
+        self.assertEqual(n, 64)
+        self.assertEqual(extra, ['--kernel', 'auto'])
+
+    def test_parse_generation_params_request_overrides(self):
+        n, extra = serve.parse_generation_params(
+            {'max_tokens': 5, 'temperature': 0.7, 'top_p': 0.9, 'top_k': 40, 'seed': 7},
+            64, ['--kernel', 'auto'])
+        self.assertEqual(n, 5)
+        self.assertIn('--kernel', extra)
+        self.assertEqual(extra[extra.index('--temperature') + 1], '0.7')
+        self.assertEqual(extra[extra.index('--top-p') + 1], '0.9')
+        self.assertEqual(extra[extra.index('--top-k') + 1], '40')
+        self.assertEqual(extra[extra.index('--seed') + 1], '7')
+
+    def test_parse_generation_params_validation(self):
+        with self.assertRaises(ValueError):
+            serve.parse_generation_params({'temperature': -1}, 1, [])
+        with self.assertRaises(ValueError):
+            serve.parse_generation_params({'top_p': 0}, 1, [])
+        with self.assertRaises(ValueError):
+            serve.parse_generation_params({'top_k': -2}, 1, [])
+
 
 if __name__ == '__main__':
     unittest.main()
