@@ -19,8 +19,8 @@ are not yet implemented.
 | C and Python agree on every byte offset at full OLMoE size (13.84 GB, offsets > 4 GiB) | **passes** |
 | `check_vs_hf.py --ref` catches corrupted logits and routing | **passes** |
 | Windows build | compiles and runs on Windows with MSVC cl (x64); all engine tests pass |
-| Matches real Hugging Face OLMoE code | **NOT yet verified. This is your gate (A, then B).** |
-| `make_tiny_hf.py`, `dump_hf_logits.py`, `run.py` with a real tokenizer | written, syntax-checked, **never run** (need torch/transformers) |
+| Matches real Hugging Face OLMoE code | **verified (Gate A):** tiny random OLMoE vs real HF `OlmoeForCausalLM`, max logit diff ~2e-6, argmax 12/12, routing 24/24. Gate B (real 7B) still pending. |
+| `make_tiny_hf.py`, `check_vs_hf.py --hf` (Gate A) | **run and PASS** (torch/transformers installed). `dump_hf_logits.py`, `run.py` with a real tokenizer | written, syntax-checked, **never run on the real 7B** (need a bigger machine with torch/transformers) |
 
 Why the NumPy reference alone isn't enough: it encodes my understanding of the OLMoE architecture.
 I checked the details that matter (QK-norm over the full projection before RoPE; no renormalisation of
