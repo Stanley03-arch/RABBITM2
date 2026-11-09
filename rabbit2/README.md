@@ -18,7 +18,7 @@ are not yet implemented.
 | Bad checkpoints (wrong model type, missing tensor, wrong shape, pre-quantized) are rejected | **passes** |
 | C and Python agree on every byte offset at full OLMoE size (13.84 GB, offsets > 4 GiB) | **passes** |
 | `check_vs_hf.py --ref` catches corrupted logits and routing | **passes** |
-| Windows build | compiles with zero warnings (MinGW-w64 cross-compile), **never run on Windows** |
+| Windows build | compiles and runs on Windows with MSVC cl (x64); all engine tests pass |
 | Matches real Hugging Face OLMoE code | **NOT yet verified. This is your gate (A, then B).** |
 | `make_tiny_hf.py`, `dump_hf_logits.py`, `run.py` with a real tokenizer | written, syntax-checked, **never run** (need torch/transformers) |
 
@@ -55,7 +55,7 @@ python tests/test_avx2.py            # experimental CPU kernel vs scalar + NumPy
 python tests/test_plan.py            # capacity planner (no engine)
 ```
 The first three should end with `ALL PASSED`; the unittest suites should end with `OK`.
-**First thing to do: run these on Windows and report any failure.**
+**Windows build verified: all tests pass with MSVC cl (x64).**
 
 ## Experimental local expert cache
 
